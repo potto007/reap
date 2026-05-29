@@ -24,9 +24,17 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from transformers.tokenization_utils_base import BatchEncoding
+from transformers.masking_utils import (
+    create_causal_mask,
+    create_sliding_window_causal_mask,
+)
 
 from reap.observer import (
     MoETransformerObserverConfig,
+)
+from reap.models.gemma4 import (
+    compute_fused_expert_activations,
+    router_probs_to_logits,
 )
 from reap.layerwise_model_utils import (
     extract_model_components,
@@ -713,6 +721,29 @@ class LayerwiseMoEObserver:
             del valid_token_mask
         gc.collect()
 
+    def _prepare_block_call(
+        self,
+        block_idx: int,
+        batch_idx: int,
+        target_device: torch.device,
+    ) -> Tuple[List[torch.Tensor], Dict[str, Any], Optional[torch.Tensor]]:
+        """Build one replayed block call: (block_input, block_kwargs, metrics_mask).
+
+        ``metrics_mask`` is the attention mask handed to the metric computation
+        (to drop padding tokens), which may differ from the mask passed to the
+        block forward. Override for architectures whose decoder layers take
+        per-layer auxiliary inputs (e.g. Gemma 4's per-layer-type rotary
+        embeddings and sliding/full attention masks); the base path replays the
+        single set of kwargs captured from block 0 to every block.
+        """
+        block_input, block_kwargs = self.replay_cache.materialize(
+            batch_idx=batch_idx,
+            target_device=target_device,
+        )
+        metrics_mask = block_kwargs.get("attention_mask", None)
+        block_kwargs = self._build_replay_kwargs(block_idx, block_kwargs)
+        return block_input, block_kwargs, metrics_mask
+
     @torch.inference_mode()
     def _forward_block(
         self,
@@ -755,14 +786,12 @@ class LayerwiseMoEObserver:
             block_outputs = []
 
             for batch_idx in tqdm(range(num_batches), desc=f"Processing {block_name}"):
-                
-                block_input, block_kwargs = self.replay_cache.materialize(
+
+                block_input, block_kwargs, attention_mask = self._prepare_block_call(
+                    block_idx=block_idx,
                     batch_idx=batch_idx,
                     target_device=target_device,
                 )
-                attention_mask = block_kwargs.get("attention_mask", None)
-
-                block_kwargs = self._build_replay_kwargs(block_idx, block_kwargs)
                 if before_forward is not None:
                     before_forward()
 
@@ -1017,3 +1046,232 @@ class LayerwiseMoEObserver:
             hook.remove()
         self.hooks.clear()
         logger.debug("Observer closed")
+
+
+class LayerwiseGemma4MoEObserver(LayerwiseMoEObserver):
+    """Layerwise observer for Gemma 4 (e.g. the text-only Gemma4ForCausalLM).
+
+    Gemma 4 breaks every assumption ``_process_moe_activations`` makes about a
+    "MoE block" (see ``reap/models/gemma4.py`` and ``Gemma4MoEExpertObserver`` in
+    ``observer.py``):
+
+      * there is no MoE-block submodule -- ``Gemma4TextRouter`` and
+        ``Gemma4TextExperts`` are siblings on the decoder layer. The base
+        ``_find_moe_module_in_block`` already returns the router (matched by class
+        name), and its captured input is the router input we need;
+      * ``num_experts`` / ``top_k`` live on the model config, not the module;
+      * the experts consume ``pre_feedforward_layernorm_2(router_input)``, not the
+        router input directly;
+      * ``Gemma4TextExperts.forward`` returns only the *summed* routed output, so
+        per-expert activations are rebuilt densely via
+        ``compute_fused_expert_activations``;
+      * the router returns ``(router_probabilities, top_k_weights, top_k_index)``,
+        so raw logits are recovered with ``router_probs_to_logits`` and the
+        selection is the router's own ``top_k_index``.
+
+    Everything downstream (``update_pruning_state``) is identical to the base.
+
+    Replay note: Gemma 4 uses hybrid attention, so decoder layers are NOT uniform
+    -- each receives a sliding- or full-attention rotary embedding and mask chosen
+    by ``config.layer_types[i]`` (see ``Gemma4TextModel.forward``). The generic
+    replay reuses block 0's kwargs for every block, which crashes on the differing
+    sliding/full shapes. ``_prepare_block_call`` instead recomputes each block's
+    rotary + mask with the model's own ``rotary_emb`` and the transformers mask
+    helpers, using the running hidden states as the shape/device proxy. Per-layer
+    (PLE) inputs and shared-KV layers are NOT supported (the 26B A4B model has both
+    disabled); the constructor refuses configs that enable them.
+    """
+
+    def __init__(self, model, hook_config, block_names=None):
+        config = model.config
+        if getattr(config, "hidden_size_per_layer_input", 0):
+            raise NotImplementedError(
+                "LayerwiseGemma4MoEObserver does not support per-layer (PLE) inputs "
+                "(hidden_size_per_layer_input > 0); use the standard prune.py path."
+            )
+        if getattr(config, "num_kv_shared_layers", 0):
+            raise NotImplementedError(
+                "LayerwiseGemma4MoEObserver does not support shared-KV layers "
+                "(num_kv_shared_layers > 0); use the standard prune.py path."
+            )
+        super().__init__(model, hook_config, block_names=block_names)
+        # layer_types[i] selects each block's attention flavor (sliding vs full).
+        self._layer_types: List[str] = list(config.layer_types)
+        # 2D padding masks (True=valid) per calibration batch, for metric masking.
+        self._padding_masks: List[Optional[torch.Tensor]] = []
+
+    @staticmethod
+    def _extract_padding_mask(batch: Any) -> Optional[torch.Tensor]:
+        """The (batch, seq) padding mask from a batch, or None when unmasked."""
+        mask = None
+        if isinstance(batch, (dict, BatchEncoding)):
+            mask = batch.get("attention_mask")
+        if torch.is_tensor(mask):
+            if mask.dim() == 1:
+                mask = mask.unsqueeze(0)
+            return mask.detach().cpu()
+        return None
+
+    def _capture_first_block_inputs(self, data_batches: List[torch.Tensor]):
+        # Record raw padding masks in the same order the base seeds the replay
+        # cache (one entry per batch), so batch_idx lines up in _prepare_block_call.
+        self._padding_masks = [self._extract_padding_mask(b) for b in data_batches]
+        super()._capture_first_block_inputs(data_batches)
+
+    def _prepare_block_call(
+        self,
+        block_idx: int,
+        batch_idx: int,
+        target_device: torch.device,
+    ) -> Tuple[List[torch.Tensor], Dict[str, Any], Optional[torch.Tensor]]:
+        block_input, _ = self.replay_cache.materialize(
+            batch_idx=batch_idx, target_device=target_device
+        )
+        hidden = block_input[0]
+        seq_len = hidden.shape[1]
+        position_ids = torch.arange(seq_len, device=target_device).unsqueeze(0)
+
+        padding_mask = (
+            self._padding_masks[batch_idx]
+            if batch_idx < len(self._padding_masks)
+            else None
+        )
+        mask_input = padding_mask.to(target_device) if padding_mask is not None else None
+
+        # Recompute this layer's rotary + attention mask (sliding vs full) exactly
+        # as Gemma4TextModel.forward does, reusing the model's own components.
+        text_model = self.model.model
+        layer_type = self._layer_types[block_idx]
+        mask_kwargs = dict(
+            config=self.model.config,
+            inputs_embeds=hidden,
+            attention_mask=mask_input,
+            past_key_values=None,
+            position_ids=position_ids,
+        )
+        if layer_type == "sliding_attention":
+            attention_mask = create_sliding_window_causal_mask(**mask_kwargs)
+        else:
+            attention_mask = create_causal_mask(**mask_kwargs)
+        position_embeddings = text_model.rotary_emb(hidden, position_ids, layer_type)
+
+        block_kwargs = self._build_replay_kwargs(
+            block_idx,
+            {
+                "position_embeddings": position_embeddings,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                # Some layers (e.g. sliding) write their KV here even when no layer
+                # reads it back (num_kv_shared_layers == 0). A fresh dict per block
+                # absorbs those writes; nothing is shared across our isolated blocks.
+                "shared_kv_states": {},
+            },
+        )
+        # For metric masking we want the 2D padding mask (True=valid), NOT the 4D
+        # causal mask; None means every token is valid.
+        return block_input, block_kwargs, padding_mask
+
+    def _valid_token_mask(
+        self, attention_mask: Optional[torch.Tensor], num_tokens: int, device: torch.device
+    ) -> Optional[torch.Tensor]:
+        """Flat (num_tokens,) boolean mask (True=valid) from a 2D or 4D mask."""
+        if attention_mask is None:
+            return None
+        attention_mask = attention_mask.to(device)
+        if attention_mask.dim() == 4:
+            mask_row = attention_mask[:, 0, -1, :]
+            mask = mask_row if mask_row.dtype == torch.bool else (mask_row == 0)
+        elif attention_mask.dim() == 2:
+            mask = attention_mask.bool()
+        else:
+            logger.warning(
+                f"Unexpected attention_mask shape {tuple(attention_mask.shape)}, ignoring"
+            )
+            return None
+        mask = mask.reshape(-1)
+        if mask.numel() != num_tokens:
+            logger.warning(
+                "Flattened mask length %s != token count %s; ignoring mask for this batch",
+                mask.numel(),
+                num_tokens,
+            )
+            return None
+        return mask
+
+    @torch.inference_mode()
+    def _process_moe_activations(
+        self,
+        block_idx: int,
+        moe_module: nn.Module,  # the Gemma4TextRouter for this layer
+        input_hidden_states: torch.Tensor,  # the router's captured input
+        device: torch.device,
+        attention_mask: torch.Tensor | None = None,
+    ):
+        config = self.model.config
+        num_experts = getattr(config, self.hook_config.num_experts_attr_name)
+        top_k = getattr(config, self.hook_config.top_k_attr_name)
+        if num_experts is None or top_k is None:
+            raise ValueError(
+                "Gemma4 layerwise observer could not read num_experts/top_k from model "
+                f"config (looked for '{self.hook_config.num_experts_attr_name}' / "
+                f"'{self.hook_config.top_k_attr_name}')."
+            )
+
+        block = self.blocks[block_idx]
+
+        # The Gemma4 router operates on flattened (T, H) hidden states; normalize
+        # whatever was captured (flat or (B, S, H)) to that shape.
+        hidden_dim = input_hidden_states.shape[-1]
+        flat_input = input_hidden_states.reshape(-1, hidden_dim)
+        num_tokens = flat_input.shape[0]
+
+        valid_token_mask = self._valid_token_mask(attention_mask, num_tokens, device)
+
+        if block_idx not in self.state:
+            self.state[block_idx] = self._initialize_block_state(num_experts)
+
+        # Experts consume the residual after pre_feedforward_layernorm_2 -- the same
+        # derivation the standard Gemma4MoEExpertObserver uses.
+        expert_input = block.pre_feedforward_layernorm_2(flat_input)
+        experts = block.experts
+        activations = compute_fused_expert_activations(
+            experts.gate_up_proj,
+            experts.down_proj,
+            experts.act_fn,
+            expert_input,
+        ).to(device)
+
+        # Re-run the router (cheap) for its (probabilities, top_k_weights, index).
+        router_output = moe_module(flat_input)
+        if not (isinstance(router_output, (tuple, list)) and len(router_output) >= 3):
+            raise ValueError(
+                "Expected Gemma4TextRouter to return "
+                "(router_probabilities, top_k_weights, top_k_index); got "
+                f"{type(router_output)}."
+            )
+        router_probabilities, _top_k_weights, top_k_index = router_output
+        router_logits = router_probs_to_logits(router_probabilities).to(device)
+        selected_experts = top_k_index.to(device)
+
+        update_pruning_state(
+            self.state[block_idx],
+            activations=activations,
+            selected_experts=selected_experts,
+            router_logits=router_logits,
+            num_experts=num_experts,
+            valid_token_mask=valid_token_mask,
+            renormalize_router_weights=self.hook_config.renormalize_router_weights,
+        )
+
+        del activations, selected_experts, router_logits
+        if valid_token_mask is not None:
+            del valid_token_mask
+        gc.collect()
+
+
+# Models whose layerwise per-block MoE processing differs from the standard
+# single-MoE-block design use a dedicated layerwise observer class; everything
+# else uses LayerwiseMoEObserver. Mirrors observer.OBSERVER_CLASS_REGISTRY.
+LAYERWISE_OBSERVER_CLASS_REGISTRY = {
+    "Gemma4ForCausalLM": LayerwiseGemma4MoEObserver,
+}

@@ -46,7 +46,10 @@ from reap.args import (
 from reap.data import load_category_batches, parse_composite_dataset_spec
 from reap.model_util import patched_model_map
 from reap.observer import OBSERVER_CONFIG_REGISTRY
-from reap.layerwise_observer import LayerwiseMoEObserver
+from reap.layerwise_observer import (
+    LayerwiseMoEObserver,
+    LAYERWISE_OBSERVER_CLASS_REGISTRY,
+)
 from reap.layerwise_model_utils import cleanup_memory
 
 # NOTE: reap.eval imports vllm/lm_eval at module load (the [eval] extra); it is
@@ -178,8 +181,12 @@ def record_activations_layerwise(
         record_pruning_metrics_only=obs_args.record_pruning_metrics_only,
     )
 
-    # Create layerwise observer
-    observer = LayerwiseMoEObserver(
+    # Create layerwise observer (architecture-specific subclass when registered,
+    # e.g. Gemma 4's inlined-router / fused-expert decoder layer).
+    observer_cls = LAYERWISE_OBSERVER_CLASS_REGISTRY.get(
+        model_class_name, LayerwiseMoEObserver
+    )
+    observer = observer_cls(
         model=model,
         hook_config=hook_config,
     )

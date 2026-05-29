@@ -54,6 +54,12 @@ def _tiny_gemma4():
         vocab_size=64,
         max_position_embeddings=64,
         enable_moe_block=True,
+        # Match the real 26B A4B checkpoint's regime: per-layer (PLE) inputs and
+        # shared-KV layers are disabled there. With num_hidden_layers=2 the default
+        # layer_types are ['sliding_attention', 'full_attention'], so this still
+        # exercises Gemma 4's hybrid-attention path (the layerwise replay's hard part).
+        hidden_size_per_layer_input=0,
+        num_kv_shared_layers=0,
     )
     torch.manual_seed(0)
     return Gemma4ForCausalLM(cfg).eval(), cfg
@@ -210,3 +216,85 @@ def test_setup_observer_renorm_off_when_obs_arg_disabled():
         assert observer.hook_config.renormalize_router_weights is False
     finally:
         observer.close_hooks()
+
+
+# --- Layerwise (block-wise) observer ---------------------------------------
+# The layerwise path processes one decoder block at a time (memory-efficient for
+# the real 26B model on a single GPU). Gemma 4 needs a dedicated subclass because
+# its router/experts are siblings on the decoder layer rather than a MoE block.
+
+
+def _fixed_batches(cfg, *, n_batches=3, batch=2, seq=6, seed=1):
+    """A reusable, deterministic list of input-id batches."""
+    g = torch.Generator().manual_seed(seed)
+    return [
+        torch.randint(0, cfg.vocab_size, (batch, seq), generator=g)
+        for _ in range(n_batches)
+    ]
+
+
+def test_layerwise_registry_selects_gemma_subclass():
+    from reap.layerwise_observer import (
+        LayerwiseGemma4MoEObserver,
+        LAYERWISE_OBSERVER_CLASS_REGISTRY,
+    )
+
+    assert (
+        LAYERWISE_OBSERVER_CLASS_REGISTRY["Gemma4ForCausalLM"]
+        is LayerwiseGemma4MoEObserver
+    )
+
+
+def test_layerwise_gemma4_produces_valid_metrics():
+    from reap.layerwise_observer import LayerwiseGemma4MoEObserver
+    from reap.observer import Gemma4MoEObserverHookConfig
+
+    model, cfg = _tiny_gemma4()
+    observer = LayerwiseGemma4MoEObserver(model, Gemma4MoEObserverHookConfig())
+    report = observer.record_all_blocks(data_batches=_fixed_batches(cfg))
+
+    assert set(report.keys()) == {0, 1}
+    for layer in (0, 1):
+        assert report[layer]["total_tokens"] > 0
+        assert report[layer]["reap"].shape == (NUM_EXPERTS,)
+        assert torch.isfinite(report[layer]["reap"]).all()
+        assert report[layer]["expert_frequency"].shape == (NUM_EXPERTS,)
+
+
+def test_layerwise_gemma4_matches_standard_observer():
+    """The layerwise observer must compute the same per-block metrics as the
+    standard full-forward observer on identical inputs. Both models are seeded
+    identically by ``_tiny_gemma4``; the layerwise replay reconstructs each
+    block's input, so the router selections and activations -- hence
+    expert_frequency and reap -- should agree."""
+    from reap.observer import Gemma4MoEExpertObserver, Gemma4MoEObserverHookConfig
+    from reap.layerwise_observer import LayerwiseGemma4MoEObserver
+
+    model_std, cfg = _tiny_gemma4()
+    batches = _fixed_batches(cfg, n_batches=4, seq=8)
+
+    standard = Gemma4MoEExpertObserver(model_std, Gemma4MoEObserverHookConfig())
+    for batch in batches:
+        with torch.no_grad():
+            model_std(batch)
+    std_report = standard.report_state()
+    standard.close_hooks()
+
+    model_lw, _ = _tiny_gemma4()  # same seed -> identical weights
+    layerwise = LayerwiseGemma4MoEObserver(model_lw, Gemma4MoEObserverHookConfig())
+    lw_report = layerwise.record_all_blocks(data_batches=batches)
+
+    assert set(lw_report.keys()) == set(std_report.keys()) == {0, 1}
+    for layer in (0, 1):
+        assert lw_report[layer]["total_tokens"] == std_report[layer]["total_tokens"]
+        # Identical router selections -> identical expert-selection counts.
+        assert torch.allclose(
+            lw_report[layer]["expert_frequency"].float(),
+            std_report[layer]["expert_frequency"].float(),
+        )
+        # Same activations + logits -> matching saliency, modulo float order.
+        assert torch.allclose(
+            lw_report[layer]["reap"], std_report[layer]["reap"], rtol=1e-3, atol=1e-4
+        )
+
+    layerwise.close_hooks()
