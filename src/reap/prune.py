@@ -167,7 +167,11 @@ def prune(
 
     pruned_model_dir.mkdir(parents=True, exist_ok=True)
     start = time.time()
-    model.save_pretrained(pruned_model_dir)
+    # Shard the checkpoint so the writer only materializes one shard at a time. A
+    # single-file save of a large pruned model (tens of GB) builds the whole
+    # serialization buffer at once and can exhaust host RAM on top of the resident
+    # model; small shards keep the write-time overhead bounded.
+    model.save_pretrained(pruned_model_dir, max_shard_size="4GB")
     end = time.time()
     logger.info(
         f"Pruned model saved to {pruned_model_dir} in {end - start:.2f} seconds"

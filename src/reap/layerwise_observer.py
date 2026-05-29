@@ -166,6 +166,7 @@ class LayerwiseMoEObserver:
         model: nn.Module,
         hook_config: MoETransformerObserverConfig,
         block_names: Optional[List[str]] = None,
+        free_offloaded_blocks: bool = False,
     ):
         """
         Initialize the layerwise (blockwise) MoE observer.
@@ -174,10 +175,23 @@ class LayerwiseMoEObserver:
             model: The PyTorch MoE model to observe
             hook_config: Configuration for hooks (contains MoE-specific settings)
             block_names: List of transformer block names. Auto-detected if None.
+            free_offloaded_blocks: When True (single-pass only), drop a block's
+                weights to the meta device after it is processed instead of moving
+                them back to CPU. The model is loaded mmap-backed, so moving a block
+                to GPU and back to CPU *materializes* it into real RAM; across all
+                blocks that accumulates the entire model in RAM and defeats the
+                mmap load. Freeing instead bounds peak RAM to ~one block -- essential
+                when the model approaches host RAM. Safe only for a single pass
+                (each block used once); ignored when batch grouping replays blocks.
+                The model is reloaded fresh for the prune step, so freeing here is
+                harmless. Defaults to False to preserve the original behavior.
         """
         self.model = model
         self.hook_config = hook_config
         self._memory_cleanup_freq = 4
+        self._free_offloaded_blocks = free_offloaded_blocks
+        # Set per run by record_all_blocks; freeing is only valid for a single pass.
+        self._single_pass_mode = True
 
         # Auto-detect decoder blocks if not provided
         self.block_names = block_names or find_decoder_blocks(self.model)
@@ -302,16 +316,21 @@ class LayerwiseMoEObserver:
         return final_device
 
     def _offload_current_block(self) -> None:
-        """Offload the current block to CPU and release memory."""
+        """Offload the current block, releasing GPU (and optionally RAM) memory."""
         block_idx = self.currently_loaded_block_idx
         if block_idx < 0:
             return
 
         block = self._block_at(block_idx)
 
+        # In a single pass each block is used once, so free its weights to the meta
+        # device instead of materializing them back into RAM (see free_offloaded_blocks).
+        offload_device = (
+            "meta" if (self._free_offloaded_blocks and self._single_pass_mode) else "cpu"
+        )
         try:
             if block is not None:
-                self._move_block(block, block_idx, "cpu")
+                self._move_block(block, block_idx, offload_device)
         finally:
             self.currently_loaded_block_idx = -1
             cleanup_memory(synchronize=False)
@@ -961,10 +980,15 @@ class LayerwiseMoEObserver:
             Dictionary mapping block numbers to their metrics
         """
         if batch_group_size is None or batch_group_size >= len(data_batches):
+            self._single_pass_mode = True
             return self._record_all_blocks_for_batch_group(data_batches, save_path)
 
         if batch_group_size < 1:
             raise ValueError("batch_group_size must be at least 1 when provided")
+
+        # Multiple groups replay every block once per group, so blocks must persist
+        # across groups -- freeing them after the first pass would break later groups.
+        self._single_pass_mode = False
 
         total_groups = (len(data_batches) + batch_group_size - 1) // batch_group_size
         logger.info(
@@ -1082,7 +1106,7 @@ class LayerwiseGemma4MoEObserver(LayerwiseMoEObserver):
     disabled); the constructor refuses configs that enable them.
     """
 
-    def __init__(self, model, hook_config, block_names=None):
+    def __init__(self, model, hook_config, block_names=None, free_offloaded_blocks=False):
         config = model.config
         if getattr(config, "hidden_size_per_layer_input", 0):
             raise NotImplementedError(
@@ -1094,7 +1118,12 @@ class LayerwiseGemma4MoEObserver(LayerwiseMoEObserver):
                 "LayerwiseGemma4MoEObserver does not support shared-KV layers "
                 "(num_kv_shared_layers > 0); use the standard prune.py path."
             )
-        super().__init__(model, hook_config, block_names=block_names)
+        super().__init__(
+            model,
+            hook_config,
+            block_names=block_names,
+            free_offloaded_blocks=free_offloaded_blocks,
+        )
         # layer_types[i] selects each block's attention flavor (sliding vs full).
         self._layer_types: List[str] = list(config.layer_types)
         # 2D padding masks (True=valid) per calibration batch, for metric masking.

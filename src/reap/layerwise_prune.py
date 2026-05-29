@@ -186,9 +186,13 @@ def record_activations_layerwise(
     observer_cls = LAYERWISE_OBSERVER_CLASS_REGISTRY.get(
         model_class_name, LayerwiseMoEObserver
     )
+    # Free each block after processing (single pass) so a mmap-loaded model near
+    # host-RAM size doesn't accumulate into RAM via GPU<->CPU round trips. The model
+    # is reloaded fresh for the prune step, so freeing during observation is safe.
     observer = observer_cls(
         model=model,
         hook_config=hook_config,
+        free_offloaded_blocks=True,
     )
 
     # Process all blocks
@@ -364,18 +368,25 @@ def main():
             f"Pruned model already exists at {pruned_model_dir}. Skipping pruning."
         )
     else:
-        # Reload model on auto device for pruning
-        logger.info("Reloading model on GPU for pruning...")
+        # Reload model on CPU for pruning. Pruning is pure tensor slicing
+        # (index_select on the expert/router weights) and needs no GPU. Critically,
+        # device_map="auto" can offload later layers to the meta/CPU-offload device
+        # when the model approaches host memory; slicing a meta `.data` is a no-op on
+        # the real offloaded weights, so those layers silently save UNPRUNED. Loading
+        # on CPU keeps every weight a real tensor; with low_cpu_mem_usage the source
+        # is mmap-backed, so only the retained (post-slice) experts materialize.
+        logger.info("Reloading model on CPU for pruning...")
         if model is not None:
             del model
         cleanup_memory()
 
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            device_map="auto",
+            device_map="cpu",
             torch_dtype="auto",
             trust_remote_code=True,
             local_files_only=True,
+            low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
         )
 
         # Prune
