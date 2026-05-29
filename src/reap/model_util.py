@@ -115,6 +115,22 @@ MODEL_ATTRS = {
         "num_experts": "n_routed_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
+    # Gemma 4 (e.g. text-only Gemma4ForCausalLM extracted from the 26B A4B VLM).
+    # Routing is inlined in the decoder layer (no MoE-block submodule), experts are
+    # fused 3D tensors, and the router is a compound module (router.proj +
+    # router.per_expert_scale). It therefore uses a dedicated pruning path in
+    # prune.py rather than get_moe(); `moe_block` is intentionally None.
+    "Gemma4ForCausalLM": {
+        "moe_block": None,
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": True,
+        "router": "router",
+        "num_experts": "num_experts",
+        "num_experts_per_tok": "top_k_experts",
+    },
 }
 
 

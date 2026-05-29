@@ -27,7 +27,20 @@ import logging
 import torch
 from datasets import Dataset, DatasetDict, load_dataset
 from transformers import AutoTokenizer, BatchEncoding
-from vllm import TokensPrompt
+
+try:
+    from vllm import TokensPrompt
+except ImportError:
+    # vllm is only needed to emit TokensPrompt objects (return_vllm_tokens_prompt=True),
+    # used by the eval/serving paths -- not by pruning/calibration. In a vllm-free env
+    # (e.g. this Gemma-only fork on transformers>=5.5.0.dev0) keep the module importable
+    # and fail only if a caller actually requests that format.
+    class TokensPrompt(dict):  # type: ignore[no-redef]
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "return_vllm_tokens_prompt=True requires vllm, which is not installed. "
+                "Install vllm, or use return_vllm_tokens_prompt=False (the pruning default)."
+            )
 
 
 logger = logging.getLogger(__name__)

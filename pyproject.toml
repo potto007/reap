@@ -10,26 +10,43 @@ requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.7.0",
     "datasets>=3.6.0, <4.0.0",
-    "evalplus[vllm]>=0.3.1",
     "jupyter>=1.1.1",
-    "lm-eval[vllm,api]>=0.4.9.1",
     "matplotlib>=3.10.3",
     "python-dotenv>=1.1.0",
     "seaborn>=0.13.2",
     "torch==2.7.1",
-    # "transformers==4.53.3",  # latest version working for ernie.
-    "transformers==4.55.0",
+    # Gemma-only fork: Gemma 4 (26B A4B) support landed in transformers 5.5.0.dev0,
+    # so 5.5.0 is the minimum. Released 5.5.x+ are on PyPI (this integration was read
+    # against the 5.8.x line); pin to a specific release (e.g. ==5.8.1) for full
+    # reproducibility if desired. The old 4.55.0 pin (ernie/other models) is dropped.
+    "transformers>=5.5.0",
     "umap-learn>=0.5.7",
-    "vllm==0.10.0",
-    "livecodebench",
-    "deepspeed>=0.17.4",
-    "trl>=0.21.0",
     "hatchling>=1.27.0",
     # "flash-attn>=2.7.1,<=2.8.0", # required for xformers for Llama4. Might need to manually install with --no-build-isolation
     # "flash-attn>=2.8.3",
     "wandb>=0.21.1",
+]
+
+[project.optional-dependencies]
+# vllm-based evaluation stack. Kept OUT of core dependencies because vllm==0.10.0
+# pins transformers below the version Gemma 4 requires, so it cannot co-resolve with
+# transformers>=5.5.0.dev0. The pruning/calibration path does not need any of these
+# (reap.data and reap.prune import without vllm). Install in a SEPARATE environment
+# when you want to evaluate pruned checkpoints:  `uv sync --extra eval`.
+eval = [
+    "evalplus[vllm]>=0.3.1",
+    "lm-eval[vllm,api]>=0.4.9.1",
+    "vllm==0.10.0",
+    "livecodebench",
     "crfm-helm",
     "evalscope",
+]
+# Training/merge libraries. Both depend on transformers and may not yet support
+# transformers>=5.5.0.dev0; they are not needed for pruning/calibration, so they live
+# here to keep core `uv sync` resolvable. Install with `uv sync --extra train`.
+train = [
+    "deepspeed>=0.17.4",
+    "trl>=0.21.0",
 ]
 
 [tool.uv.sources]

@@ -33,7 +33,9 @@ from reap.cluster import (
     dynamic_frequency_penalized_clustering,
 )
 from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
-from reap.eval import run_evaluate
+from reap.models.gemma4 import slice_gemma4_moe
+# NOTE: reap.eval imports vllm at module load; it is imported lazily inside main()
+# under `do_eval` so the pruning/calibration path stays usable in a vllm-free env.
 import shutil
 
 logger = logging.getLogger(__name__)
@@ -51,6 +53,7 @@ def prune(
     Prune the model based on the observer data and clustering.
     """
     model_attrs = MODEL_ATTRS[model.__class__.__name__]
+    is_gemma4 = model.__class__.__name__ == "Gemma4ForCausalLM"
 
     for layer in observer_data:
         if "expert_proba" not in observer_data[layer]:
@@ -105,6 +108,13 @@ def prune(
         retained_expert_indicies = [
             i for i in range(num_experts) if i not in experts_to_prune
         ]
+        # Gemma 4: routing is inlined in the decoder layer (no MoE-block module),
+        # so slice the fused experts + compound router directly. The parallel dense
+        # MLP path is left untouched.
+        if is_gemma4:
+            decoder_layer = model.model.layers[layer]
+            slice_gemma4_moe(decoder_layer, retained_expert_indicies)
+            continue
         # prune experts
         moe = get_moe(model, layer)
         if not model_attrs["fused"]:
@@ -323,6 +333,8 @@ def main():
 
     # eval
     if reap_args.do_eval:
+        from reap.eval import run_evaluate  # lazy: pulls in vllm
+
         remove_hook_from_module(model, recurse=True)
         model.to("cpu")
         del model

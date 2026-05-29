@@ -33,7 +33,11 @@ from reap.args import (
 )
 from reap.merge import MergeMethod, MoEExpertMerger
 from reap.data import load_category_batches, parse_composite_dataset_spec
-from reap.observer import OBSERVER_CONFIG_REGISTRY, MoETransformerObserver
+from reap.observer import (
+    OBSERVER_CONFIG_REGISTRY,
+    OBSERVER_CLASS_REGISTRY,
+    MoETransformerObserver,
+)
 from reap.cluster import (
     get_penalty_vector,
     hierarchical_clustering,
@@ -117,24 +121,28 @@ def create_results_directory(model_name: str, dataset_name: str) -> pathlib.Path
 
 def _setup_observer(model, obs_args):
     """Create and return an MoETransformerObserver for the given model."""
+    model_cls_name = model.__class__.__name__
     try:
-        renormalize_router_weights = (
-            getattr(model.config, "norm_topk_prob", False)
-            and obs_args.renormalize_router_weights
-        )
+        norm_topk_prob = getattr(model.config, "norm_topk_prob", None)
+        if norm_topk_prob is None:
+            # Gemma 4's router renormalizes its top-k weights by construction, but
+            # its config carries no `norm_topk_prob` flag.
+            norm_topk_prob = model_cls_name == "Gemma4ForCausalLM"
+        renormalize_router_weights = bool(norm_topk_prob) and obs_args.renormalize_router_weights
         if renormalize_router_weights:
             logger.info("Renormalizing topk router weights to sum to 1.")
-        observer_config = OBSERVER_CONFIG_REGISTRY[model.__class__.__name__](
+        observer_config = OBSERVER_CONFIG_REGISTRY[model_cls_name](
             distance_measure="cosine",
             renormalize_router_weights=renormalize_router_weights,
             record_pruning_metrics_only=obs_args.record_pruning_metrics_only,
         )
     except KeyError:
         raise ValueError(
-            f"No observer configuration registered for model '{model.__class__.__name__}'. "
+            f"No observer configuration registered for model '{model_cls_name}'. "
             f"Supported: {list(OBSERVER_CONFIG_REGISTRY.keys())}"
         )
-    return MoETransformerObserver(
+    observer_cls = OBSERVER_CLASS_REGISTRY.get(model_cls_name, MoETransformerObserver)
+    return observer_cls(
         model=model,
         hook_config=observer_config,
     )
