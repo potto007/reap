@@ -56,7 +56,9 @@ from reap.model_util import (
     patched_model_map,
     get_super_expert_indices,
 )
-from reap.eval import run_evaluate
+# NOTE: reap.eval imports vllm/lm_eval at module load (the [eval] extra); it is
+# imported lazily inside main() below so the pruning/calibration path stays
+# importable without the eval stack.
 from reap.cluster_plots import plot_cluster_analysis
 from reap.metrics import get_distance_fn
 
@@ -837,6 +839,8 @@ def main():
         torch.cuda.empty_cache()
         gc.collect()
         model_args.model_name = merged_model_dir
+        from reap.eval import run_evaluate  # lazy: pulls in vllm/lm_eval
+
         run_evaluate(model_args, merged_model_dir / "eval", eval_args, reap_args.seed)
 
 

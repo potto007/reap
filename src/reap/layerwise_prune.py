@@ -48,7 +48,10 @@ from reap.model_util import patched_model_map
 from reap.observer import OBSERVER_CONFIG_REGISTRY
 from reap.layerwise_observer import LayerwiseMoEObserver
 from reap.layerwise_model_utils import cleanup_memory
-from reap.eval import run_evaluate
+
+# NOTE: reap.eval imports vllm/lm_eval at module load (the [eval] extra); it is
+# imported lazily inside the do_eval block below so the layer-wise pruning path
+# stays importable without the eval stack.
 from reap.prune import prune as prune_model
 from reap.prune import get_pruned_model_dir
 from reap.main import dump_args_to_yaml, create_results_directory
@@ -405,6 +408,8 @@ def main():
         cleanup_memory()
 
         model_args.model_name = pruned_model_dir
+        from reap.eval import run_evaluate  # lazy: pulls in vllm/lm_eval
+
         run_evaluate(
             model_args,
             pruned_model_dir / "eval",
